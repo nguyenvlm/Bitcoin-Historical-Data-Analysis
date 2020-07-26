@@ -1,0 +1,405 @@
+---
+title: |
+  ![](btc_logo.png){width=2in}  
+  Bitcoin Historical Data Analysis
+author: "Nguyen Vuong"
+output:
+  prettydoc::html_pretty:
+    theme: leonids
+    highlight: github
+    number_sections: false
+    toc: true
+    toc_depth: 6
+    smart: true
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    eval = TRUE,
+    echo = TRUE,
+    message = FALSE,
+    error = FALSE,
+    tidy = FALSE,
+    include = TRUE,
+    results = "markup",
+    cache = TRUE,
+    comment = "##",
+    fig.width = 11,
+    fig.height = 7,
+    out.width = "100%",
+    out.height = "100%"
+)
+```
+
+> WORK IN PROGRESS...
+
+# I. Data Description
+
+## 1. Credit
+This data description (except for 1. Credit) and the "Bitcoin Historical Data" dataset were contributed by **Zielak**, *Neuroscience Ph.D.* as a dataset on [Kaggle platform](https://kaggle.com). 
+
+The "Bitcoin Historical Data" dataset is distributed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0) license.
+
+Important links:
+                       
+* [Zielak's Kaggle profile](https://kaggle.com/mczielinski)
+
+* [Original dataset](https://kaggle.com/mczielinski/bitcoin-historical-data)
+
+## 2. Context
+Bitcoin is the longest running and most well known cryptocurrency, first released as open source in 2009 by the anonymous Satoshi Nakamoto. Bitcoin serves as a decentralized medium of digital exchange, with transactions verified and recorded in a public distributed ledger (the blockchain) without the need for a trusted record keeping authority or central intermediary. Transaction blocks contain a SHA-256 cryptographic hash of previous transaction blocks, and are thus "chained" together, serving as an immutable record of all transactions that have ever occurred. As with any currency/commodity on the market, bitcoin trading and financial instruments soon followed public adoption of bitcoin and continue to grow. Included here is historical bitcoin market data at 1-min intervals for select bitcoin exchanges where trading takes place. Happy (data) mining!
+
+## 3. Content
+**coinbaseUSD1-mindata2014-12-01to_2019-01-09.csv**
+
+**bitstampUSD1-mindata2012-01-01to_2020-04-22.csv**
+
+CSV files for select bitcoin exchanges for the time period of Jan 2012 to April 2020, with minute to minute updates of OHLC (Open, High, Low, Close), Volume in BTC and indicated currency, and weighted bitcoin price. Timestamps are in Unix time. Timestamps without any trades or activity have their data fields filled with NaNs. If a timestamp is missing, or if there are jumps, this may be because the exchange (or its API) was down, the exchange (or its API) did not exist, or some other unforseen technical error in data reporting or gathering. All effort has been made to deduplicate entries and verify the contents are correct and complete to the best of my ability, but obviously trust at your own risk.
+
+## 4. Acknowledgements and Inspiration
+Bitcoin charts for the data. The various exchange APIs, for making it difficult or unintuitive enough to get OHLC and volume data at 1-min intervals that I set out on this data scraping project. Satoshi Nakamoto and the novel core concept of the blockchain, as well as its first execution via the bitcoin protocol. I'd also like to thank viewers like you! Can't wait to see what code or insights you all have to share.
+
+# II. Required Packages
+
+The following packages are required to reproduce this report:
+
+* tidyverse
+* tidyquant
+* plotly
+
+```{r import_libs, include=TRUE, results='hide'}
+# Turn off R warning
+options(warn=-1)
+
+# Import necessary libs
+library(tidyverse)
+library(tidyquant)
+library(plotly)
+
+# Set ggplot theme
+theme_set(theme_minimal())
+```
+
+
+# III. Variable Explanation and Main Targets
+
+## 1. Variable Explanation
+Each row contains BTC trading data of a 1-min interval:
+
+* **Timestamp** is start time of the interval, in Unix time
+
+* **Open** is BTC price (in USD) of the 1st transaction in the interval
+
+* **High** is the best BTC price (in USD) in the interval
+
+* **Low** is the worst BTC price (in USD) in the interval
+
+* **Close** is BTC price (in USD) of the last transaction in the interval
+
+* **Volume (BTC)** is the amount of BTC transacted in the interval
+
+* **Volume (Currency)** is the amount of USD transacted in the interval
+
+* **Weighted Price** is BTC volume-weighted average price (BTC VWAP)
+
+## 2. Main Targets
+In this notebook, we will proceed on analyzing transaction data in **bitstampUSD1-mindata2012-01-01to_2020-04-22.csv**
+
+Since BTC price movement at minutes scale (original data) is pretty meaningless, our targets will be set to forecasting BTC price movement and BTC VWAP of the next day (in USD) given transaction data of previous days. 
+
+**So, what particular questions will our ML models have to answer?**
+
+* What will be the BTC VWAP of the next day?
+
+* What will be the BTC price movement (Close - Open) of the next day?
+
+* What will be the direction off BTC price movement (Close - Open >= 0) of the next day?
+
+Let's get an insight of what we have here...
+
+# IV. 1-min interval transaction data
+
+## 1. Data Summary
+
+```{r}
+PATH = "./Data/bitstampUSD_1-min_data_2012-01-01_to_2020-04-22.csv"
+data = read.csv(PATH, header=TRUE)
+dim(data)
+head(data)
+summary(data)
+```
+
+## 2. Timestamp Processing
+
+```{r}
+data$Timestamp = as.POSIXct(data$Timestamp, origin = "1970-01-01", tz = "GMT")
+data$Date = as.Date(data$Timestamp,"%Y-%m-%d")
+data$Month = as.factor(format(data$Timestamp,"%m"))
+data$Year = as.factor(format(data$Timestamp,"%Y"))
+data$Year.Month = as.factor(format(data$Timestamp,"%Y-%m"))
+data$Weekday = factor(weekdays(data$Timestamp), ordered=TRUE, levels= c(
+    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"))
+data$Hour = as.factor(format(data$Timestamp, "%H"))
+head(data)
+```
+
+## 3. Missing value interpretation
+In data summary, we can see that this data contains a lot of NaN rows (`r sum(is.na(data$Open))`/`r dim(data)[1]` ~ `r sum(is.na(data$Open))/dim(data)[1] * 100`%), which are intervals without any BTC transaction. Now we will study the missing pattern.
+
+**Why is it important to study the missing pattern?**
+
+I have a few assumptions about the data: 
+
+* In the beginning of BTC history, there should be very few transactions. When BTC became more popular among crypto-traders, there should be more transactions. Therefore, the 1-min intervals without any transaction per day should decrease over the time.
+
+* The missing rows could have been affected by some cyclical features (e.g. hours of the day, days of the week, months in the year, etc.)
+
+Be noted that in 2011 there was only data of the last day (December 31st), so we will exclude 2011 from our future inferences.
+
+Let's make some plots to see if my assumptions are right or wrong... 
+
+### a. Create nan indicator and fill nan with previous values
+
+```{r}
+data[is.na(data)] = NA
+
+# Create nan indicator, which will be set to 1 if the row is nan
+data$nan = as.numeric(is.na(data$Volume_.BTC.))
+
+# Fill na of OHLC with previous values:
+data = fill(data, Open, High, Low, Close)
+
+# Fill na of Volume and Weighted Price with zero:
+data[is.na(data)] = 0
+
+head(data)
+summary(data)
+```
+   
+### b. Count of nan over the time
+
+```{r}
+# Yearly nan counting:
+nan = tapply(data$nan, data$Year, FUN=sum)
+nan = data.frame(year=rownames(nan), nan.count=nan)
+
+# Plot nan.count over years:
+ggplotly(
+    ggplot(data = nan, aes(x = year, y = nan.count, group=1)) + 
+    geom_line(color = "#00AFBB", size = 0.5) +
+    geom_point(color = "#FF5044", size = 2) +
+    labs(title="Yearly count of nan")
+)
+
+# Monthly nan counting:
+nan = tapply(data$nan, data$Year.Month, FUN=sum)
+nan = data.frame(year.month=rownames(nan), nan.count=nan)
+
+# Plot nan.count over year.months:
+ggplotly(
+    ggplot(data = nan, aes(x = year.month, y = nan.count, group=1)) + 
+    geom_line(color = "#00AFBB", size = 0.5) +
+    geom_point(color = "#FF5044", size = 1) +
+    labs(title="Monthly count of nan") +
+    theme(axis.text.x = element_text(size=6, angle=90))
+)
+```
+   
+Based on the yearly and monthly graphs, we can come to a conclusion that there is a clear descending trend of nan.count over the time.
+
+### c. Cyclical rate of nan
+
+We will observe hourly rate of nan before and after 2013. Hopefully we will study some cyclical patterns of nan.
+   
+```{r}
+before.data = data[data$Year %in% c(2011, 2012),]
+after.data = data[!(data$Year %in% c(2011, 2012)),]
+
+# nan.rate over hours of the day:
+before.nan = tapply(before.data$nan, before.data$Hour, FUN=mean)
+after.nan = tapply(after.data$nan, after.data$Hour, FUN=mean)
+nan = data.frame(hour=rownames(before.nan), before.2013=before.nan, after.2013=after.nan)
+df = nan %>% gather(key = "variable", value = "value", -hour)
+
+# Plot nan.rate over hours of the day:
+ggplotly(
+    ggplot(data = df, aes(x = hour, y = value)) + 
+    geom_line(aes(color = variable, group=1), size = 1) +
+    scale_color_manual(values = c("#00AFBB", "#E7B800")) +
+    geom_point(color = "#FF5044", size = 1.5) +
+    labs(title="Rate of nan over hours of the day", x="hour",  y="nan.rate")
+)
+```
+
+Rate of nan before 2013 was very high. After 2013, the rate decreased as BTC became more popular among traders. 
+   
+Let's seperate the data of these two time sections into different plots.
+
+```{r}
+# Plot nan.rate over hours of the day (before 2013):
+ggplot(data = nan, aes(x = hour, group=1)) + 
+geom_polygon(aes(y = before.2013),color = "#00AFBB", size = 0.5, fill = "#00AFBB10") +
+geom_point(aes(y = before.2013), color = "#FF5044", size = 1.5) + 
+coord_polar(theta = "x", start = -pi/24) +
+labs(title="Rate of nan over hours of the day (before 2013)", x="hour",  y="nan.rate")
+
+# Plot nan.rate over hours of the day (after 2013):
+ggplot(data = nan, aes(x = hour, group=1)) + 
+geom_polygon(aes(y = after.2013),color = "#00AFBB", size = 0.5, fill = "#00AFBB10") +
+geom_point(aes(y = after.2013), color = "#FF5044", size = 1.5) + 
+coord_polar(theta = "x", start = -pi/24) +
+labs(title="Rate of nan over hours of the day (after 2013)", x="hour",  y="nan.rate")
+```
+
+Based on rate of nan over hours of the day plots, rate of nan was low during working hours and dramatically increased during leisure hours.
+
+```{r}
+# nan.rate over days of the week:
+before.nan = tapply(before.data$nan, before.data$Weekday, FUN=mean)
+after.nan = tapply(after.data$nan, after.data$Weekday, FUN=mean)
+nan = data.frame(weekday=rownames(before.nan), before.2013=before.nan, after.2013=after.nan)
+nan$weekday = ordered(nan$weekday, levels= c(
+    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"))
+nan = with(nan, nan[order(weekday),])
+
+# Plot nan.rate over days of the week (before 2013):
+ggplot(data = nan, aes(x = weekday, group=1)) + 
+geom_polygon(aes(y = before.2013),color = "#00AFBB", size = 0.5, fill = "#00AFBB10") +
+geom_point(aes(y = before.2013), color = "#FF5044", size = 1.5) + 
+coord_polar(theta = "x", start = -pi/7) +
+labs(title="Rate of nan over days of the week (before 2013)", x="weekday",  y="nan.rate")
+
+# Plot nan.rate over days of the week (after 2013):
+ggplot(data = nan, aes(x = weekday, group=1)) + 
+geom_polygon(aes(y = after.2013),color = "#00AFBB", size = 0.5, fill = "#00AFBB10") +
+geom_point(aes(y = after.2013), color = "#FF5044", size = 1.5) + 
+coord_polar(theta = "x", start = -pi/7) +
+labs(title="Rate of nan over days of the week (after 2013)", x="weekday",  y="nan.rate")
+```
+
+Based on rate of nan over days of the week plots, rate of nan was low during working days and dramatically increased during leisure days (Saturday, Sunday).
+
+```{r}
+# nan.rate over months in the year:
+before.nan = tapply(before.data$nan, before.data$Month, FUN=mean)
+after.nan = tapply(after.data$nan, after.data$Month, FUN=mean)
+nan = data.frame(month=rownames(before.nan), before.2013=before.nan, after.2013=after.nan)
+
+# Plot nan.rate over months in the year (before 2013):
+ggplot(data = nan, aes(x = month, group=1)) + 
+geom_polygon(aes(y = before.2013),color = "#00AFBB", size = 0.5, fill = "#00AFBB10") +
+geom_point(aes(y = before.2013), color = "#FF5044", size = 1.5) + 
+coord_polar(theta = "x", start = 0) +
+labs(title="Rate of nan over months in the year (before 2013)", x="month",  y="nan.rate")
+
+# Plot nan.rate over months in the year (after 2013):
+ggplot(data = nan, aes(x = month, group=1)) + 
+geom_polygon(aes(y = after.2013),color = "#00AFBB", size = 0.5, fill = "#00AFBB10") +
+geom_point(aes(y = after.2013), color = "#FF5044", size = 1.5) + 
+coord_polar(theta = "x", start = 0) +
+labs(title="Rate of nan over months in the year (after 2013)", x="month",  y="nan.rate")
+```
+
+Based on rate of nan over months in the year plots:
+
+* Before 2013, rate of nan was low during the 1st and 2nd quarter of the year, then dramatically increased during the other quarters of the year.
+* After 2013, rate of nan was low during the 1st and 3rd quarter of the year, then dramatically increased during the 2nd and 4th quarter of the year.
+
+Rate/count of nan values might be a good indicator for the activeness of the market.
+
+**The lower the nan indicator is, the more active the market is!!!**
+
+This might somehow affect the BTC price movement. Let's study the relation between nan indicator as well as other trading indicators and BTC price in the following sections.
+   
+# V. 1-day interval transaction data
+
+In order to fulfill our proposed target, we have to transform the original data into the form of 1-day interval transaction data:
+
+* **Open price** of a day will be open price of the first 1-min interval of the day.
+
+* **High price** of a day will be maximum of every 1-min high price in the day.
+
+* **Low price** of a day will be minimum of every 1-min low price in the day.
+
+* **Close price** of a day will be close price of the last 1-min interval of the day.
+
+* **Volume** of a day will be sum of every 1-min volume in the day.
+
+* **Weighted price** of a day will be calculated by dividing trading volume in USD by trading volume in BTC.
+
+* **Nan indicator** of a day will be mean of every 1-min nan indicator in the day.
+
+* Other date features will be reserved. Hour feature will be removed.
+
+## 1. Data Transformation
+```{r include=FALSE}
+rm(list=c("after.data", "after.nan", "before.data", "before.nan", "df", "nan"))
+```
+```{r}
+daily_open = tapply(data$Open, data$Date, FUN=function(x){x[1]})
+daily_close = tapply(data$Close, data$Date, FUN=function(x){x[length(x)]})
+daily_high = tapply(data$High, data$Date, FUN=max)
+daily_low = tapply(data$Low, data$Date, FUN=min)
+daily_movement = mapply(FUN='-', daily_close, daily_open)
+daily_volume_btc = tapply(data$Volume_.BTC., data$Date, FUN=sum)
+daily_volume_usd = tapply(data$Volume_.Currency., data$Date, FUN=sum)
+daily_vwap = mapply(FUN='/', daily_volume_usd, daily_volume_btc)
+daily_nan = tapply(data$nan, data$Date, FUN=mean)
+date = as.Date(rownames(daily_open))
+
+ddata = data.frame(
+    Date = date,
+    Weekday = as.factor(weekdays(date)),
+    Month = as.factor(format(date, "%m")),
+    Year = as.factor(format(date, "%Y")),
+    Open = daily_open,
+    High = daily_high,
+    Low = daily_low,
+    Close = daily_close,
+    Movement = daily_movement,
+    Volume.BTC = daily_volume_btc,
+    Volume.USD = daily_volume_usd,
+    VWAP = daily_vwap,
+    NA.rate = daily_nan,
+    VWAP.next = c(daily_vwap[2:length(daily_vwap)], NA),
+    Movement.next = c(daily_movement[2:length(daily_movement)], NA),
+    Movement.dir.next = c(ifelse(daily_movement[2:length(daily_movement)] >= 0, 1, 0 ), NA)
+)
+rownames(ddata) = NULL
+head(ddata)
+tail(ddata)
+   
+```
+```{r include=FALSE}
+rm(list=c("data"))
+```
+## 2. BTC Trading Visualization
+   
+```{r}
+ddata %>% 
+    plot_ly(
+        x = ~Date,
+        type = "candlestick",
+        open = ~Open,
+        high = ~High,
+        low = ~Low,
+        close = ~Close,
+        name = "Daily Movement"
+    ) %>%
+    add_lines(
+        y = ~VWAP,
+        name = "VWAP",
+        line = list(color = 'rgb(22, 96, 167)', width = 1)
+    ) %>%
+    layout(
+        title = 'BTC Price Chart\nJanuary 2012 - April 2020',
+        xaxis = list(title = "Date"),
+        yaxis = list (title = "Price (USD)")
+    )
+```
+
+## 3. NA.rate vs Datetime features
+
